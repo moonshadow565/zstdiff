@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <bit>
 #include "mmap.hpp"
 #include "zstd.h"
 
@@ -25,50 +26,52 @@ static int exit_bad_args() noexcept {
     return EXIT_FAILURE;
 }
 
+static void print_progress(std::size_t done, std::size_t total) {
+    constexpr char const* const unit_name[] = {
+        "B", "KB", "MB", "GB",
+    };
+    auto const remain = total - done;
+    std::size_t unit_index = 0;
+    std::size_t unit_mult = 1;
+    while (remain / (unit_mult * 1024u) > 1 && unit_index != 3) {
+        unit_mult *= 1024u;
+        ++unit_index;
+    }
+    ::printf("\rRemain: %-5llu %s",
+             static_cast<unsigned long long>(remain / unit_mult),
+             unit_name[unit_index]);
+}
+
 static int zst_diff(std::filesystem::path const& path_old,
                     std::filesystem::path const& path_new,
                     std::filesystem::path const& path_diff,
                     int level) noexcept {
-    // mmap old file
     auto map_old = MMap<char const>();
+    ::printf("Maping old file...\n");
     if (auto error = map_old.open(path_old)) {
         return exit_mmap_error("open old file", error);
     }
 
-    // mmap new file
     auto map_new = MMap<char const>();
+    ::printf("Maping new file...\n");
     if (auto error = map_new.open(path_new)) {
         return exit_mmap_error("open new file", error);
     }
-
 
     // create context and set correct params for buffer-less compression(no internal copies)
     auto const ctx = ZSTD_createCCtx();
     if (ctx == nullptr) {
         return exit_other_error("allocate compress context");
     }
-    if (auto const error = ZSTD_CCtx_setPledgedSrcSize(ctx, map_new.size()); ZSTD_isError(error)) {
-        return exit_zstd_error("set setPledgedSrcSize", error);
-    }
-    if (auto const error = ZSTD_CCtx_setParameter(ctx, ZSTD_c_compressionLevel, 1); ZSTD_isError(error)) {
-        return exit_zstd_error("set compressionLevel", level);
-    }
-    if (auto const error = ZSTD_CCtx_setParameter(ctx, ZSTD_c_checksumFlag, 1); ZSTD_isError(error)) {
-        return exit_zstd_error("set checksumFlag", error);
-    }
-    if (auto const error = ZSTD_CCtx_setParameter(ctx, ZSTD_c_stableInBuffer, 1); ZSTD_isError(error)) {
-        return exit_zstd_error("set stableInBuffer", error);
-    }
-    if (auto const error = ZSTD_CCtx_setParameter(ctx, ZSTD_c_stableOutBuffer, 1); ZSTD_isError(error)) {
-        return exit_zstd_error("set stableOutBuffer", error);
-    }
-
     // create and set dict as raw content, by reference(no copies)
-    auto params = ZSTD_getParams(level, map_new.size(), map_old.size());
+    auto cparams = ZSTD_getCParams(level, map_new.size(), map_old.size());
+    auto const dict_size_plus = static_cast<std::uint64_t>(map_old.size() + 1024);
+    cparams.windowLog = static_cast<unsigned>(64u - std::countl_zero(dict_size_plus) - 1);
+    ::printf("Loading dictionary...\n");
     auto const dict = ZSTD_createCDict_advanced(map_old.data(), map_old.size(),
                                                 ZSTD_dlm_byRef,
                                                 ZSTD_dct_rawContent,
-                                                params.cParams,
+                                                cparams,
                                                 {});
     if (dict == nullptr) {
         return exit_other_error("create dictionary");
@@ -80,6 +83,7 @@ static int zst_diff(std::filesystem::path const& path_old,
     // create/open diff file and resize it to estimated size
     auto const size_diff_estimated = ZSTD_compressBound(map_new.size());
     auto map_diff = MMap<char>();
+    ::printf("Maping diff file...\n");
     if (auto error = map_diff.create(path_diff, size_diff_estimated)) {
         return exit_mmap_error("create diff file", error);
     }
@@ -87,21 +91,46 @@ static int zst_diff(std::filesystem::path const& path_old,
     // do compression
     std::size_t in_pos = 0;
     std::size_t out_pos = 0;
-    while (auto const result = ZSTD_compressStream2_simpleArgs(ctx,
-                                                               map_diff.data(), map_diff.size(), &out_pos,
-                                                               map_new.data(), map_new.size(), &in_pos,
-                                                               ZSTD_e_end)) {
+    ::printf("Compress start...\n");
+    auto const fparams = ZSTD_frameParameters {
+            .contentSizeFlag = 1,
+            .checksumFlag = 1,
+            .noDictIDFlag = 0,
+    };
+    if (auto const error = ZSTD_compressBegin_usingCDict_advanced(ctx, dict, fparams, map_new.size());
+            ZSTD_isError(error)) {
+        return exit_zstd_error("compress begin", error);
+    }
+    auto const block_size = ZSTD_getBlockSize(ctx);
+    while (auto const in_left = map_new.size() - in_pos) {
+        auto const to_read = std::min(block_size, in_left);
+        auto result = std::size_t{};
+        if (in_left <= block_size) {
+            result = ZSTD_compressEnd(ctx,
+                                      map_diff.data() + out_pos, map_diff.size() - out_pos,
+                                      map_new.data() + in_pos, to_read);
+        } else {
+            result = ZSTD_compressContinue(ctx,
+                                           map_diff.data() + out_pos, map_diff.size() - out_pos,
+                                           map_new.data() + in_pos, to_read);
+        }
         if (ZSTD_isError(result)) {
             ZSTD_freeCCtx(ctx);
             ZSTD_freeCDict(dict);
             [[maybe_unused]] auto const unused_ = map_diff.close(0);
+            ::printf("\n");
             return exit_zstd_error("compress file", result);
         }
+        in_pos += to_read;
+        out_pos += result;
+        print_progress(in_pos, map_new.size());
     }
     // truncate and close the file
+    ::printf("\nFlush diff file...\n");
     if (auto error = map_diff.close(out_pos)) {
         return exit_mmap_error("close diff file", error);
     }
+    ::printf("Done!\n");
 
     // free context and dict structs
     ZSTD_freeCCtx(ctx);
