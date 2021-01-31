@@ -30,12 +30,14 @@ static int zst_patch(std::filesystem::path const& path_old,
                      std::filesystem::path const& path_new) noexcept {
     // mmap old file
     auto map_old = MMap<char const>();
+    ::printf("Mapping old file...\n");
     if (auto error = map_old.open(path_old)) {
         return exit_mmap_error("open old file", error);
     }
 
     // mmap diff file
     auto map_diff = MMap<char const>();
+    ::printf("Mapping diff file...\n");
     if (auto error = map_diff.open(path_diff)) {
         return exit_mmap_error("create diff file", error);
     }
@@ -47,6 +49,7 @@ static int zst_patch(std::filesystem::path const& path_old,
     }
 
     // create new dict by reference(no copies)
+    ::printf("Loading dictionary...\n");
     auto const dict = ZSTD_createDDict_advanced(map_old.data(), map_old.size(),
                                                 ZSTD_dlm_byRef,
                                                 ZSTD_dct_rawContent,
@@ -68,6 +71,7 @@ static int zst_patch(std::filesystem::path const& path_old,
         return exit_zstd_error("extract content size", new_size_ex);
     }
     auto map_new = MMap<char>();
+    ::printf("Mapping new file...\n");
     if (auto error = map_new.create(path_new, new_size_ex)) {
         return exit_mmap_error("open new file", error);
     }
@@ -78,6 +82,7 @@ static int zst_patch(std::filesystem::path const& path_old,
     if (auto const error = ZSTD_decompressBegin_usingDDict(ctx, dict); ZSTD_isError(error)) {
         return exit_zstd_error("begin decompress", error);
     }
+    ::printf("Decompress start...\n");
     while (auto const next_in_size = ZSTD_nextSrcSizeToDecompress(ctx)) {
         if (ZSTD_isError(next_in_size)) {
             return exit_zstd_error("next in size", next_in_size);
@@ -85,6 +90,7 @@ static int zst_patch(std::filesystem::path const& path_old,
         auto const left_in_size = map_diff.size() - in_pos;
         auto const actual_in_size = std::min(next_in_size, left_in_size);
 
+        ::printf("\rDecompress: %-20llu", static_cast<unsigned long long>(left_in_size));
         auto const left_out_size = map_new.size() - out_pos;
         auto const next_out_size = ZSTD_decompressContinue(ctx,
                                                            map_new.data() + out_pos, left_out_size,
@@ -95,6 +101,8 @@ static int zst_patch(std::filesystem::path const& path_old,
         in_pos += next_in_size;
         out_pos += next_out_size;
     }
+    ::printf("\rDecompress: %-20llu\n", static_cast<unsigned long long>(map_diff.size() - in_pos));
+    ::printf("Done!\n");
 
     // free context and dict structs
     ZSTD_freeDCtx(ctx);

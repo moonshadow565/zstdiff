@@ -29,14 +29,14 @@ static int zst_diff(std::filesystem::path const& path_old,
                     std::filesystem::path const& path_new,
                     std::filesystem::path const& path_diff,
                     int level) noexcept {
-    // mmap old file
     auto map_old = MMap<char const>();
+    ::printf("Maping old file...\n");
     if (auto error = map_old.open(path_old)) {
         return exit_mmap_error("open old file", error);
     }
 
-    // mmap new file
     auto map_new = MMap<char const>();
+    ::printf("Maping new file...\n");
     if (auto error = map_new.open(path_new)) {
         return exit_mmap_error("open new file", error);
     }
@@ -65,6 +65,7 @@ static int zst_diff(std::filesystem::path const& path_old,
 
     // create and set dict as raw content, by reference(no copies)
     auto params = ZSTD_getParams(level, map_new.size(), map_old.size());
+    ::printf("Loading dictionary...\n");
     auto const dict = ZSTD_createCDict_advanced(map_old.data(), map_old.size(),
                                                 ZSTD_dlm_byRef,
                                                 ZSTD_dct_rawContent,
@@ -80,6 +81,7 @@ static int zst_diff(std::filesystem::path const& path_old,
     // create/open diff file and resize it to estimated size
     auto const size_diff_estimated = ZSTD_compressBound(map_new.size());
     auto map_diff = MMap<char>();
+    ::printf("Maping diff file...\n");
     if (auto error = map_diff.create(path_diff, size_diff_estimated)) {
         return exit_mmap_error("create diff file", error);
     }
@@ -87,10 +89,12 @@ static int zst_diff(std::filesystem::path const& path_old,
     // do compression
     std::size_t in_pos = 0;
     std::size_t out_pos = 0;
+    ::printf("Compress start...\n");
     while (auto const result = ZSTD_compressStream2_simpleArgs(ctx,
                                                                map_diff.data(), map_diff.size(), &out_pos,
                                                                map_new.data(), map_new.size(), &in_pos,
                                                                ZSTD_e_end)) {
+        ::printf("Compress continue...\n");
         if (ZSTD_isError(result)) {
             ZSTD_freeCCtx(ctx);
             ZSTD_freeCDict(dict);
@@ -99,9 +103,11 @@ static int zst_diff(std::filesystem::path const& path_old,
         }
     }
     // truncate and close the file
+    ::printf("Truncate diff file...\n");
     if (auto error = map_diff.close(out_pos)) {
         return exit_mmap_error("close diff file", error);
     }
+    ::printf("Done!\n");
 
     // free context and dict structs
     ZSTD_freeCCtx(ctx);
