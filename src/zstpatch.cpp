@@ -25,6 +25,22 @@ static int exit_bad_args() noexcept {
     return EXIT_FAILURE;
 }
 
+static void print_progress(std::size_t done, std::size_t total) {
+    constexpr char const* const unit_name[] = {
+        "B", "KB", "MB", "GB",
+    };
+    auto const remain = total - done;
+    std::size_t unit_index = 0;
+    std::size_t unit_mult = 1;
+    while (remain / (unit_mult * 1024u) > 1 && unit_index != 3) {
+        unit_mult *= 1024u;
+        ++unit_index;
+    }
+    ::printf("\rRemain: %-5llu %s",
+             static_cast<unsigned long long>(remain / unit_mult),
+             unit_name[unit_index]);
+}
+
 static int zst_patch(std::filesystem::path const& path_old,
                      std::filesystem::path const& path_diff,
                      std::filesystem::path const& path_new) noexcept {
@@ -85,23 +101,28 @@ static int zst_patch(std::filesystem::path const& path_old,
     ::printf("Decompress start...\n");
     while (auto const next_in_size = ZSTD_nextSrcSizeToDecompress(ctx)) {
         if (ZSTD_isError(next_in_size)) {
+            ::printf("\n");
             return exit_zstd_error("next in size", next_in_size);
         }
         auto const left_in_size = map_diff.size() - in_pos;
         auto const actual_in_size = std::min(next_in_size, left_in_size);
 
-        ::printf("\rDecompress: %-20llu", static_cast<unsigned long long>(left_in_size));
         auto const left_out_size = map_new.size() - out_pos;
         auto const next_out_size = ZSTD_decompressContinue(ctx,
                                                            map_new.data() + out_pos, left_out_size,
                                                            map_diff.data() + in_pos, actual_in_size);
         if (ZSTD_isError(next_out_size)) {
+            ::printf("\n");
             return exit_zstd_error("decompress continue", next_out_size);
         }
         in_pos += next_in_size;
         out_pos += next_out_size;
+        print_progress(in_pos, map_diff.size());
     }
-    ::printf("\rDecompress: %-20llu\n", static_cast<unsigned long long>(map_diff.size() - in_pos));
+    ::printf("\nFlush new file...\n");
+    if (auto error = map_new.close()) {
+        return exit_mmap_error("close new file", error);
+    }
     ::printf("Done!\n");
 
     // free context and dict structs
